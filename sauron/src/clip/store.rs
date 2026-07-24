@@ -6,13 +6,29 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
+use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension, Row};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 pub type ClipResult<T> = Result<T, String>;
 
 const VALID_KINDS: &[&str] = &["fact", "checkpoint", "rollback", "artifact-ref"];
+const SCHEMA_VERSION: i64 = 1;
+const ITEM_COLUMNS: &[(&str, &str)] = &[
+    ("namespace", "TEXT NOT NULL DEFAULT 'default'"),
+    ("kind", "TEXT NOT NULL DEFAULT 'fact'"),
+    ("tags", "TEXT NOT NULL DEFAULT '[]'"),
+    ("source", "TEXT"),
+    ("created_at", "TEXT NOT NULL DEFAULT ''"),
+    ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+    ("pinned", "INTEGER NOT NULL DEFAULT 0"),
+    ("validated", "INTEGER NOT NULL DEFAULT 0"),
+    ("supersedes_key", "TEXT"),
+    ("expires_at", "TEXT"),
+    ("checksum", "TEXT NOT NULL DEFAULT ''"),
+    ("metadata", "TEXT NOT NULL DEFAULT '{}'"),
+    ("version", "INTEGER NOT NULL DEFAULT 1"),
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Item {
@@ -106,12 +122,12 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: Option<&Path>) -> ClipResult<Self> {
-        let path = path.map(PathBuf::from).unwrap_or_else(default_db_path);
+        let path = resolve_db_path(path);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("create {}: {e}", parent.display()))?;
         }
-        let conn = Connection::open(&path).map_err(err)?;
+        let conn = Connection::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(10))
             .map_err(err)?;
         conn.execute_batch(
@@ -121,8 +137,31 @@ impl Store {
             ",
         )
         .map_err(err)?;
-        ensure_schema(&conn)?;
+        ensure_schema(&conn)
+            .map_err(|e| format!("initialize clipboard database {}: {e}", path.display()))?;
         Ok(Self { conn, path })
+    }
+
+    pub fn open_read_only(path: Option<&Path>) -> ClipResult<Self> {
+        let path = resolve_db_path(path);
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("open clipboard database {} read-only: {e}", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(10))
+            .map_err(err)?;
+        conn.pragma_update(None, "query_only", true).map_err(err)?;
+        ensure_read_schema(&conn, &path)?;
+        Ok(Self { conn, path })
+    }
+
+    pub fn open_for_read(path: Option<&Path>) -> ClipResult<Self> {
+        let path = resolve_db_path(path);
+        if path.exists() {
+            Self::open_read_only(Some(&path))
+        } else {
+            // Preserve the original CLI behavior for a brand-new store:
+            // the first read command initializes an empty database.
+            Self::open(Some(&path))
+        }
     }
 
     #[allow(dead_code)] // consumed by Sauron's handoff wrapper
@@ -556,8 +595,14 @@ impl Store {
             .conn
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .map_err(err)?;
+        let schema_version: i64 = self
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(err)?;
         Ok(json!({
             "ok": integrity == "ok",
+            "database": self.path.display().to_string(),
+            "schema_version": schema_version,
             "integrity_check": integrity,
             "stats": self.stats()?,
         }))
@@ -747,6 +792,10 @@ pub fn default_db_path() -> PathBuf {
     db_path_from(&start)
 }
 
+fn resolve_db_path(path: Option<&Path>) -> PathBuf {
+    path.map(PathBuf::from).unwrap_or_else(default_db_path)
+}
+
 /// Resolve the clipboard database as if the process were running inside
 /// `start`. Workspace panes use this before launch so their storage identity
 /// does not depend on a new terminal session's inherited cwd.
@@ -820,9 +869,12 @@ fn ensure_schema(conn: &Connection) -> ClipResult<()> {
         ",
     )
     .map_err(err)?;
-    ensure_column(conn, "kind", "TEXT NOT NULL DEFAULT 'fact'")?;
-    ensure_column(conn, "validated", "INTEGER NOT NULL DEFAULT 0")?;
-    ensure_column(conn, "supersedes_key", "TEXT")?;
+    // Migrate the complete current row shape before creating indexes or
+    // preparing queries that reference newer columns. Legacy Forge stores can
+    // contain data while missing any of these later additions.
+    for &(name, definition) in ITEM_COLUMNS {
+        ensure_column(conn, name, definition)?;
+    }
     conn.execute_batch(
         "
         CREATE INDEX IF NOT EXISTS idx_items_key ON items(key);
@@ -858,16 +910,52 @@ fn ensure_schema(conn: &Connection) -> ClipResult<()> {
         );
         ",
     );
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(err)?;
     Ok(())
 }
 
-fn ensure_column(conn: &Connection, name: &str, definition: &str) -> ClipResult<()> {
+fn ensure_read_schema(conn: &Connection, path: &Path) -> ClipResult<()> {
+    let columns = item_columns(conn)?;
+    let missing = ITEM_COLUMNS
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !columns.contains(*name))
+        .collect::<Vec<_>>();
+    if columns.is_empty()
+        || !columns.contains("id")
+        || !columns.contains("key")
+        || !columns.contains("value")
+    {
+        return Err(format!(
+            "clipboard database {} has no compatible items table; initialize it with `clip --db {} doctor` from a writable shell",
+            path.display(),
+            path.display()
+        ));
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "clipboard database {} requires migration (missing: {}); run `clip --db {} doctor` from a writable shell",
+            path.display(),
+            missing.join(", "),
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn item_columns(conn: &Connection) -> ClipResult<BTreeSet<String>> {
     let mut stmt = conn.prepare("PRAGMA table_info(items)").map_err(err)?;
     let columns = stmt
         .query_map([], |row| row.get::<_, String>(1))
         .map_err(err)?
-        .flatten()
-        .collect::<BTreeSet<_>>();
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(err)?;
+    Ok(columns)
+}
+
+fn ensure_column(conn: &Connection, name: &str, definition: &str) -> ClipResult<()> {
+    let columns = item_columns(conn)?;
     if !columns.contains(name) {
         conn.execute(
             &format!("ALTER TABLE items ADD COLUMN {name} {definition}"),
@@ -1123,6 +1211,87 @@ mod tests {
                 .pinned
         );
         drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn migrates_populated_legacy_schema_before_creating_indexes() {
+        let path = std::env::temp_dir().join(format!(
+            "sauron-clip-legacy-{}-{}.sqlite3",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE items (
+                    id INTEGER PRIMARY KEY,
+                    key TEXT NOT NULL UNIQUE,
+                    value TEXT NOT NULL,
+                    namespace TEXT NOT NULL DEFAULT 'default',
+                    tags TEXT NOT NULL DEFAULT '[]',
+                    source TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    checksum TEXT NOT NULL,
+                    metadata TEXT NOT NULL DEFAULT '{}',
+                    version INTEGER NOT NULL DEFAULT 1
+                );
+                INSERT INTO items (
+                    key, value, namespace, tags, created_at, updated_at,
+                    pinned, checksum, metadata, version
+                ) VALUES (
+                    'legacy.key', 'legacy value', 'project', '[]',
+                    '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                    0, 'legacy-checksum', '{}', 4
+                );
+                ",
+            )
+            .unwrap();
+        }
+
+        let error = Store::open_read_only(Some(&path)).unwrap_err();
+        assert!(error.contains(path.to_str().unwrap()));
+        assert!(error.contains("expires_at"));
+        assert!(error.contains("doctor"));
+
+        let store = Store::open(Some(&path)).unwrap();
+        let item = store.get("legacy.key").unwrap().unwrap();
+        assert_eq!(item.value, "legacy value");
+        assert_eq!(item.kind, "fact");
+        assert!(!item.validated);
+        assert_eq!(item.expires_at, None);
+        assert_eq!(item.version, 4);
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'index' AND name = 'idx_items_expires_at'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let doctor = store.doctor().unwrap();
+        assert_eq!(doctor["database"], path.to_str().unwrap());
+        assert_eq!(doctor["schema_version"], SCHEMA_VERSION);
+        drop(store);
+
+        let mut read_only = Store::open_read_only(Some(&path)).unwrap();
+        assert_eq!(
+            read_only.get("legacy.key").unwrap().unwrap().value,
+            "legacy value"
+        );
+        assert!(read_only
+            .put("should.fail", "read-only", PutOptions::default())
+            .unwrap_err()
+            .contains("readonly"));
+        drop(read_only);
         let _ = std::fs::remove_file(path);
     }
 
