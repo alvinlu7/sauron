@@ -47,7 +47,15 @@ fn execute(args: &mut Vec<String>) -> ClipResult<i32> {
     }
 
     let path = db.as_deref().map(Path::new);
-    let mut store = Store::open(path)?;
+    let read_only = matches!(
+        command.as_str(),
+        "get" | "copy" | "search" | "list" | "recent" | "export" | "stats"
+    );
+    let mut store = if read_only {
+        Store::open_for_read(path)?
+    } else {
+        Store::open(path)?
+    };
     match command.as_str() {
         "put" => put(&mut store, args, false),
         "update" => put(&mut store, args, true),
@@ -375,6 +383,8 @@ fn doctor(store: &Store, args: &[String]) -> ClipResult<i32> {
     if parsed.flags.contains("json") {
         print_json(&value)?;
     } else {
+        println!("database\t{}", value["database"].as_str().unwrap_or(""));
+        println!("schema_version\t{}", value["schema_version"]);
         println!("ok\t{ok}");
         println!(
             "integrity_check\t{}",
